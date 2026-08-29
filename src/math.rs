@@ -1,10 +1,6 @@
-use std::io::Write;
 use std::fmt::Debug;
-use std::io::BufWriter;
-use std::ops::Add;
-use egui::Vec2;
-use petgraph::stable_graph::{NodeIndex, StableGraph};
-use rand::random;
+use std::path::Component::ParentDir;
+use rust_igraph::*;
 
 pub struct AutoCells
 <
@@ -60,7 +56,6 @@ AutoCells<StateType, STATE_COUNT, ADJACENT_COUNT>
 
         }).collect()
     }
-
 }
 
 impl<const STATE_COUNT: usize, const ADJACENT_COUNT: usize> AutoCells<usize, STATE_COUNT, ADJACENT_COUNT> {
@@ -82,55 +77,48 @@ impl<const STATE_COUNT: usize, const ADJACENT_COUNT: usize> AutoCells<usize, STA
         }
     }
 
-    pub fn adjacency_graph(&self) -> egui_graphs::Graph {
 
-        let mut g: StableGraph<(), ()> = StableGraph::new();
+    /// returns a graph of the "shape" of a given autocells state, showing all nodes and the adjacencies between them.
+    pub fn shape_graph(&self) -> Graph {
 
-        let worlds = self.iterator();
-        let nodes: Vec<_> = worlds.map(|_| {
+        let mut graph = Graph::new(self.world_size as u32, true).unwrap();
 
-            g.add_node(())
-        }).collect();
+        (0..self.world_size).for_each(|i| {
 
-        let worlds = self.iterator();
-        let mut i = 0;
-        worlds.for_each(|w| {
+            self.adjacent_functions.iter().for_each(|f| {
 
-            g.add_edge(nodes[i], nodes[self.world_to_index(self.tick(w))], ());
-
-            i += 1;
+                graph.add_edge(VertexId::from(i as u32), VertexId::from(f(i) as u32)).unwrap();
+            })
         });
 
-        let mut g = egui_graphs::Graph::from(&g);
-
-        let node_indices: Vec<NodeIndex> = g.nodes_iter().map(|(i, _)| {
-
-            i
-        }).collect();
-
-        node_indices.iter().for_each(|i| {
-
-            let n = g.node_mut(*i).unwrap();
-
-            n.set_location(n.location().add(Vec2::new(random::<f32>() * 10000.0, random::<f32>() * 10000.0)))
-        });
-
-        g
+        graph
     }
 
-    pub fn write_edge_file(&self, name: String) {
+    /// returns a functional graph representing self.tick(w) for all world-states "w".
+    pub fn action_graph(&self) -> Graph {
 
-        let file = std::fs::File::create(name).unwrap();
-        let mut writer = BufWriter::new(file);
+        let world_count = STATE_COUNT.pow(self.world_size as u32) as u32;
 
-        writeln!(writer, "Source,Target").unwrap();
+        let mut graph = Graph::new(world_count, true).unwrap();
 
-        self.iterator().for_each(|w| {
+        self.iterator().for_each(|i| {
 
-            writeln!(writer, "{},{}", self.world_to_index(w.clone()), self.world_to_index(self.tick(w)));
+            graph.add_edge(
+
+                VertexId::from(Self::world_to_num(i.clone()) as u32),
+                VertexId::from(Self::world_to_num(self.tick(i)) as u32),
+            ).unwrap();
         });
 
-        writer.flush();
+        graph
+    }
+
+    pub fn world_to_num(world: Vec<usize>) -> usize {
+
+        (0..world.len()).map(|i| -> usize {
+
+            world[i] * STATE_COUNT.pow(i as u32)
+        }).sum()
     }
 }
 
@@ -221,4 +209,45 @@ impl<const STATE_COUNT: usize> Iterator for AutoCellsIterator<STATE_COUNT> {
 
         Some(out)
     }
+}
+
+/// transforms a functional graph into a vector of trees with flipped order and loops collapsed to a single point, along with the size of their core loops.
+pub fn to_trees(graph: &Graph, cull_leaves: bool) -> Vec<(usize, Graph)> {
+
+    decompose(&graph.reverse().unwrap().to_undirected(ToUndirectedMode::Each).unwrap()).unwrap().into_iter().map(|subgraph| {
+
+        let mut subgraph = subgraph.to_directed(ToDirectedMode::Arbitrary).unwrap();
+
+        let cycle = find_cycle(&subgraph, CycleMode::Out).unwrap();
+        let center_vertex: VertexId = { subgraph.add_vertices(1).unwrap(); subgraph.vcount() - 1 };
+
+        let cycle_child_edges = cycle.vertices.iter().map(|cycle_vertex| -> Vec<u32> {
+
+            subgraph.edge_ids().filter_map(|edge_id| {
+                if subgraph.edge(edge_id).unwrap().0 != *cycle_vertex { None } else { Some(edge_id) }
+            }).collect()
+
+        }).flatten().collect::<Vec<u32>>();
+
+        let mut cycle_child_vertices: Vec<u32> = cycle_child_edges.iter().map(|child| { subgraph.edge(*child).unwrap().1 }).collect();
+
+        cycle_child_vertices.sort_unstable(); cycle_child_vertices.dedup();
+
+        subgraph.delete_edges(&*cycle_child_edges).unwrap();
+
+        cycle_child_vertices.iter().for_each(|cycle_child_vertex| { subgraph.add_edge(center_vertex, *cycle_child_vertex).unwrap(); });
+
+        if cull_leaves {
+
+            subgraph.delete_vertices(
+                &*(0..subgraph.vcount())
+                    .filter(|vertex_id| {
+                        subgraph.out_degree(*vertex_id).unwrap() == 0
+                    }).collect::<Vec<u32>>()
+            ).unwrap();
+        }
+
+
+        (cycle.vertices.len(), subgraph.reverse().unwrap())
+    }).collect()
 }
